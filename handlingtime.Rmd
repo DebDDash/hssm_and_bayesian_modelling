@@ -1,0 +1,573 @@
+
+```{r}
+# Load required packages
+if (!requireNamespace("brms", quietly = TRUE)) {
+  install.packages("brms")
+}
+library(tidyverse)
+library(brms)
+library(rstan)
+rstan_options(auto_write = TRUE)
+options(mc.cores = parallel::detectCores())
+library(brms)
+library(bayesplot)
+library(cmdstanr)
+library(lme4)
+library(lmerTest)
+library(rstan)
+library(posterior)
+library(performance)
+library(sjPlot)   
+```
+
+```{r}
+df_p1 <- read.csv("/Users/debarpita/Desktop/arjun/trial_wise_dataset_post.csv")
+df_p2 <- read.csv("/Users/debarpita/Desktop/arjun/trial_wise_dataset_pre.csv")
+library(dplyr)
+df <- bind_rows(df_p1, df_p2)
+```
+
+
+How does tACS change foraging behavior, specifically handling time?
+
+```{r}
+summary(df$HandlingTime)
+```
+
+Turkey IQR outlier rule - removes extremely high outliers.
+```{r}
+Q1 <- quantile(df$HandlingTime, 0.25, na.rm = TRUE)
+Q3 <- quantile(df$HandlingTime, 0.75, na.rm = TRUE)
+IQR <- Q3 - Q1
+df <- df %>% 
+  filter(HandlingTime >= Q1 - 1.5 * IQR,
+         HandlingTime <= Q3 + 1.5 * IQR)
+```
+
+```{r}
+df <- df %>%
+  mutate(HandlingTime_safe = HandlingTime + 1e-6)
+df <- df %>%
+  mutate(across(c(Reward, trait_anxiety_score, TotalCumulativeReward), 
+                list(z = ~scale(.)[,1])))
+```
+
+```{r}
+library(ggplot2)
+
+ggplot(df, aes(x = HandlingTime)) +
+  geom_histogram(aes(y = ..density..), bins = 40, fill = "grey70") +
+  geom_density(size = 1) +
+  theme_minimal()
+```
+
+Each participant has a different baseline handling time but the effect of stimulation is assumed to be the same for everyone
+```{r}
+model_gamma <- brm(
+  HandlingTime_safe ~ stim + (1|Participant_ID),
+  data = df,
+  family = Gamma(link = "log"), 
+  chains = 4,
+  iter = 3000, 
+  warmup = 1000,
+  cores = 4
+)
+
+model_student <- brm(
+  HandlingTime_safe ~ stim + (1|Participant_ID),
+  data = df,
+  family = student(link = "log"), 
+  chains = 4,
+  iter = 3000, 
+  warmup = 1000,
+  cores = 4
+)
+
+model_lognorm <- brm(
+  HandlingTime_safe ~ stim + (1|Participant_ID),
+  data = df,
+  family = lognormal(), 
+  chains = 4,
+  iter = 3000, 
+  warmup = 1000,
+  cores = 4
+)
+```
+
+For interactions in Bayesian models, z-scoring is strongly recommended as it makes priors behave properly and improves convergence
+```{r}
+df <- df %>%
+  mutate(across(c(Reward, trait_anxiety_score, 
+                  TotalCumulativeReward), 
+                list(z = ~scale(.)[,1])))
+```
+
+
+	
+```{r}
+summary(model_gamma)
+```
+sd(Intercept) = 0.14 between-person variability in baseline handling time. exp(0.14) = 1.15 this implies that a typical participant is about 15% faster or slower than the average person
+High variability - people are very different from each other
+Estimate(Intercept) =1.10 -> exp(1.10) = 3.00 - The average handling time before stimulation.
+confidence interval doesn't include 0 which is why it is credible
+stim =-0.09 -> exp(-0.09) = 0.914 Handling time is reduced by ~8.6% under stimulation.
+CI narrow which means model is confdent about above effect and it is consistent across trials
+Shape > 5: implies normal
+Rhat is 1.00 so converged
+Bulk_ESS -> middle of the distribution
+Tail_ESS -> For the extreme values 
+ess values greater than 400 so of no concern 
+stim error is within participant difference which is much smaller than intercept which is in between participants
+
+```{r}
+pp_check(model_gamma)
+```
+
+
+```{r}
+summary(model_student)
+```
+Participants differ by ~14% in baseline handling time as exp(0.13) is 1.14.Stimulation reduces handling time by ~7% Otherwise metrics very similar to previous.
+
+```{r}
+pp_check(model_student)
+```
+
+
+```{r}
+summary(model_lognorm)
+```
+
+
+```{r}
+pp_check(model_lognorm)
+```
+
+
+```{r}
+library(loo)
+
+# Compute LOO for each model
+loo_gamma   <- loo(model_gamma)
+loo_student <- loo(model_student)
+loo_lognorm <- loo(model_lognorm)
+
+# Compare models
+loo_compare(loo_gamma, loo_student, loo_lognorm)
+```
+elpd_diff (Expected Log Predictive Density Difference) -> higher is better 
+se_diff (Standard Error of Difference) -> uncertainty in the comparison.
+If |elpd_diff| > 2 × se_diff → strong evidence
+
+Student and lognorm are clearly close competitors with student being the better model.
+
+
+
+
+
+Each participant has their own baseline and their own stimulation effect. Lines are no longer parallel.
+```{r}
+model_lognorm_own <- brm(
+  HandlingTime_safe ~ stim + (1 + stim | Participant_ID),
+  data = df,
+  family = lognormal(),
+  chains = 4,
+  iter = 3000, 
+  warmup = 1000,
+  cores = 4
+)
+```
+
+
+```{r}
+summary(model_lognorm_own)
+```
+
+
+```{r}
+pp_check(model_lognorm_own)
+```
+
+```{r}
+loo_lognorm <- loo(model_lognorm)
+loo_lognorm_own <- loo(model_lognorm_own)
+# Compare models
+loo_compare(loo_lognorm_own, loo_lognorm)
+```
+
+```{r}
+model_student_own <- brm(
+  HandlingTime_safe ~ stim + (1 + stim | Participant_ID),
+  data = df,
+  family = student(),
+  chains = 4,
+  iter = 3000, 
+  warmup = 1000,
+  cores = 4
+)
+```
+
+```{r}
+summary(model_student_own)
+```
+
+```{r}
+pp_check(model_student_own)
+```
+```{r}
+loo_student_own <- loo(model_student_own)
+# Compare models
+loo_compare(loo_lognorm_own, loo_student_own)
+```
+
+
+
+How does reward magnitude affect decision time?
+A 1 SD increase in reward → ~6% faster decisions
+People adaptively speed up for more valuable resources
+```{r}
+model_reward_log <- brm(
+  HandlingTime_safe ~ Reward_z + (1 | Participant_ID),
+  data = df,
+  family = lognormal(),
+  chains = 4,
+  iter = 3000,
+  warmup = 1000,
+  cores = 4
+)
+```
+
+
+```{r}
+summary(model_reward_log)
+```
+
+
+```{r}
+pp_check(model_reward_log)
+```
+
+```{r}
+model_reward_student <- brm(
+  HandlingTime_safe ~ Reward_z + (1 | Participant_ID),
+  data = df,
+  family = student(),
+  chains = 4,
+  iter = 3000,
+  warmup = 1000,
+  cores = 4
+)
+```
+
+
+```{r}
+summary(model_reward_student)
+```
+
+```{r}
+pp_check(model_reward_student)
+```
+
+
+
+
+```{r}
+model_stim_anx <- brm(
+  HandlingTime_safe  ~ stim_cat * trait_anxiety_score_z + Reward_z + 
+    (1| Participant_ID),
+  data = df,
+  family = student(),
+  chains = 4,
+  iter = 3000,
+  warmup = 1000,
+  cores = 4
+)
+```
+
+
+```{r}
+summary(model_stim_anx)
+```
+```{r}
+ce <- conditional_effects(model_stim_anx,
+                          effects = "trait_anxiety_score_z:stim_cat")
+
+p <- plot(ce, plot = FALSE)[[1]] +
+  labs(title = "Interaction: Trait Anxiety × Stimulation",
+       subtitle = "How does anxiety level influence handling time across stimulation conditions?",
+       x = "Trait Anxiety (z-scored)",
+       y = "Handling Time") +
+  theme_minimal()
+
+print(p)
+```
+
+```{r}
+pp_check(model_stim_anx)
+```
+
+```{r}
+model_stim_anx_log <- brm(
+  HandlingTime_safe ~ stim_cat * trait_anxiety_score_z + Reward_z + 
+    (1| Participant_ID),
+  data = df,
+  family = lognormal,
+  chains = 4,
+  iter = 3000,
+  warmup = 1000,
+  cores = 4
+)
+```
+```{r}
+ce <- conditional_effects(model_stim_anx_log,
+                          effects = "trait_anxiety_score_z:stim_cat")
+
+p <- plot(ce, plot = FALSE)[[1]] +
+  labs(title = "Interaction: Trait Anxiety × Stimulation (Lognormal Model)",
+       subtitle = "How does anxiety level influence handling time across stimulation conditions?",
+       x = "Trait Anxiety (z-scored)",
+       y = "Handling Time") +
+  theme_minimal()
+
+print(p)
+```
+
+
+```{r}
+summary(model_stim_anx_log)
+```
+
+```{r}
+pp_check(model_stim_anx_log)
+```
+
+
+```{r}
+
+df <- df %>%
+  group_by(Participant_ID, stim_cat, env, patch_id) %>%
+  mutate(trial_in_patch = row_number()) %>%
+  ungroup()
+```
+
+```{r}
+model_stim_cum <- brm(
+  HandlingTime_safe ~ stim_cat * TotalCumulativeReward_z + 
+    (1| Participant_ID),
+  data = df,
+  family = student(),
+  chains = 4,
+  iter = 3000,
+  warmup = 1000,
+  cores = 4
+)
+```
+```{r}
+ce <- conditional_effects(model_stim_cum,
+                          effects = "TotalCumulativeReward_z:stim_cat")
+
+p <- plot(ce, plot = FALSE)[[1]] +
+  labs(title = "Interaction: Cumulative Reward × Stimulation",
+       subtitle = "How does accumulated reward influence handling time across stimulation conditions?",
+       x = "Total Cumulative Reward (z-scored)",
+       y = "Handling Time") +
+  theme_minimal()
+
+print(p)
+```
+
+
+```{r}
+summary(model_stim_cum)
+```
+
+
+```{r}
+pp_check(model_stim_cum)
+```
+
+
+```{r}
+df <- df %>%
+  group_by(Participant_ID, stim_cat, env) %>%
+  mutate(
+    AvgRewardRate_before = lag(AvgRewardRate)
+  ) %>%
+  ungroup()
+```
+
+
+```{r}
+df <- df %>%
+  filter(!is.na(AvgRewardRate_before))
+```
+
+
+```{r}
+df <- df %>%
+  mutate(
+    trial_in_patch_z = scale(trial_in_patch)[,1],
+    patch_id_z = scale(patch_id)[,1],
+    AvgRewardRate_before_z = scale(AvgRewardRate_before)[,1]
+  )
+```
+
+
+```{r}
+model_L1 <- brm(
+  HandlingTime_safe ~ stim_cat * Reward_z +
+    trial_in_patch_z +
+    patch_id_z +
+    (1 | Participant_ID),
+  data = df,
+  family = student(),
+  chains = 4,
+  iter = 3000,
+  warmup = 1000,
+  cores = 4
+)
+```
+
+```{r}
+ce <- conditional_effects(model_L1,
+                          effects = "Reward_z:stim_cat")
+
+p <- plot(ce, plot = FALSE)[[1]] +
+  labs(title = "Interaction: Immediate Reward × Stimulation",
+       subtitle = "How does current reward influence handling time across stimulation conditions?",
+       x = "Immediate Reward (z-scored)",
+       y = "Handling Time") +
+  theme_minimal()
+
+print(p)
+```
+
+```{r}
+summary(model_L1)
+```
+
+
+```{r}
+pp_check(model_L1)
+```
+
+
+```{r}
+model_L2 <- brm(
+  HandlingTime_safe ~ stim_cat * Reward_z +
+    trial_in_patch_z +
+    patch_id_z +
+    AvgRewardRate_before_z +
+    (1 | Participant_ID),
+  data = df,
+  family = student(),
+  chains = 4,
+  iter = 3000,
+  warmup = 1000,
+  cores = 4
+)
+```
+
+```{r}
+ce <- conditional_effects(model_L2,
+                          effects = "Reward_z:stim_cat")
+
+p <- plot(ce, plot = FALSE)[[1]] +
+  labs(title = "Interaction: Immediate Reward × Stimulation (L2 Model)",
+       subtitle = "Effect of current reward on handling time, controlling for patch position and average reward rate",
+       x = "Immediate Reward (z-scored)",
+       y = "Handling Time") +
+  theme_minimal()
+
+print(p)
+```
+
+```{r}
+summary(model_L2)
+```
+
+
+```{r}
+pp_check(model_L2)
+```
+
+
+```{r}
+model_L3 <- brm(
+  HandlingTime_safe ~ stim_cat * AvgRewardRate_before_z +
+    (1| Participant_ID),
+  data = df,
+  family = student(),
+  chains = 4,
+  iter = 3000,
+  warmup = 1000,
+  cores = 4
+)
+```
+
+```{r}
+ce <- conditional_effects(model_L3,
+                          effects = "AvgRewardRate_before_z:stim_cat")
+
+p <- plot(ce, plot = FALSE)[[1]] +
+  labs(title = "Interaction: Average Reward Rate × Stimulation",
+       subtitle = "How does global reward context influence handling time across stimulation conditions?",
+       x = "Average Reward Rate (z-scored)",
+       y = "Handling Time") +
+  theme_minimal()
+
+print(p)
+```
+
+
+```{r}
+summary(model_L3)
+```
+
+
+```{r}
+pp_check(model_L3)
+```
+
+
+```{r}
+model_L4 <- brm(
+  HandlingTime_safe ~ stim_cat * AvgRewardRate_before_z +
+    trial_in_patch_z +
+    patch_id_z +
+    trait_anxiety_score_z +
+    (1| Participant_ID),
+  data = df,
+  family = student(),
+  chains = 4,
+  iter = 3000,
+  warmup = 1000,
+  cores = 4
+)
+```
+
+```{r}
+ce <- conditional_effects(model_L4,
+                          effects = "AvgRewardRate_before_z:stim_cat")
+
+p <- plot(ce, plot = FALSE)[[1]] +
+  labs(title = "Interaction: Average Reward Rate × Stimulation (L4 Model)",
+       subtitle = "Effect of global reward context on handling time, controlling for anxiety",
+       x = "Average Reward Rate (z-scored)",
+       y = "Handling Time") +
+  theme_minimal()
+
+print(p)
+```
+
+```{r}
+summary(model_L4)
+
+```
+
+
+```{r}
+pp_check(model_L4)
+```
+
