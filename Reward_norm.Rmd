@@ -1,0 +1,441 @@
+```{r}
+library(tidyverse)
+library(brms)
+library(loo)
+library(bayesplot)
+library(rstan)
+```
+
+```{r}
+rstan_options(auto_write = TRUE)
+options(mc.cores = parallel::detectCores())
+```
+
+```{r}
+df_p1 <- read.csv("/Users/debarpita/Desktop/arjun/trial_wise_dataset_post.csv")
+df_p2 <- read.csv("/Users/debarpita/Desktop/arjun/trial_wise_dataset_pre.csv")
+library(dplyr)
+df <- bind_rows(df_p1, df_p2)
+```
+
+```{r}
+cat(sprintf("Total observations: %d\n", nrow(df)))
+cat(sprintf("Pre-stim: %d\n", sum(df$stim_cat == "pre")))
+cat(sprintf("Post-stim: %d\n", sum(df$stim_cat == "post")))
+```
+
+```{r}
+# IQR-based outlier removal on HandlingTime (global)
+Q1  <- quantile(df$HandlingTime, 0.25, na.rm = TRUE)
+Q3  <- quantile(df$HandlingTime, 0.75, na.rm = TRUE)
+IQR <- Q3 - Q1
+df  <- df %>%
+  filter(HandlingTime >= Q1 - 1.5 * IQR,
+         HandlingTime <= Q3 + 1.5 * IQR)
+
+cat(sprintf("After outlier removal: %d\n", nrow(df)))
+```
+
+```{r}
+# Safety offset on HandlingTime to prevent division-by-zero
+df <- df %>%
+  mutate(HandlingTime_safe = HandlingTime + 1e-6)
+
+# Trial index within each patch
+df <- df %>%
+  group_by(Participant_ID, stim_cat, env, patch_id) %>%
+  mutate(trial_in_patch = row_number()) %>%
+  ungroup()
+
+# Lagged average reward rate (from previous trial within participant x stim x env)
+df <- df %>%
+  group_by(Participant_ID, stim_cat, env) %>%
+  mutate(AvgRewardRate_before = lag(AvgRewardRate)) %>%
+  ungroup() %>%
+  filter(!is.na(AvgRewardRate_before))
+```
+
+```{r}
+df <- df %>%
+  mutate(
+    tt_base_env1 = ifelse(stim_cat == "pre",  3,  5),  
+    tt_base_env2 = ifelse(stim_cat == "pre", 10, 12),   
+    rew_base    = ifelse(stim_cat == "pre",  91, 181), 
+    rew_hi      = ifelse(stim_cat == "pre",   9,  19),
+    rew_dec     = ifelse(stim_cat == "pre",  10,  20)  
+  )
+```
+
+```{r}
+# -----------------------------------------------------------------------
+# THEORETICAL BOUNDS — computed per trial using task parameters
+# R_max           : highest possible reward (start of a fresh patch)
+# R_min_theo      : expected floor at this trial depth (can reach 0)
+# Both are condition-specific (pre vs post) via the parameters above
+# -----------------------------------------------------------------------
+df <- df %>%
+  mutate(
+    R_max_theo      = rew_base + rew_hi,
+    R_min_theo      = pmax(rew_base - rew_dec * trial_in_patch, 0)
+  )
+```
+
+```{r}
+# -----------------------------------------------------------------------
+# EMPIRICAL BOUNDS — computed within Participant x stim_cat x env
+# This respects both condition AND environment simultaneously
+# -----------------------------------------------------------------------
+df <- df %>%
+  group_by(Participant_ID, stim_cat, env) %>%
+  mutate(
+    R_min_empirical = min(Reward, na.rm = TRUE),
+    R_max_empirical = max(Reward, na.rm = TRUE)
+  ) %>%
+  ungroup()
+
+# PATCH-LEVEL empirical max — for patch-wise pct-of-max normalization
+df <- df %>%
+  group_by(Participant_ID, stim_cat, env, patch_id) %>%
+  mutate(
+    R_max_empirical_patch = max(Reward, na.rm = TRUE)
+  ) %>%
+  ungroup()
+```
+
+```{r}
+# -----------------------------------------------------------------------
+# NORMALIZATION METHODS
+# All within-group operations grouped by Participant_ID x stim_cat x env
+# -----------------------------------------------------------------------
+df <- df %>%
+  group_by(Participant_ID, stim_cat, env) %>%
+  mutate(
+
+    # ------------------------------------------------------------------
+    # METHOD 1a: Min-Max (Theoretical bounds, per-trial)
+    # Uses condition-specific R_max_theo and trial-depth-specific R_min_theo
+    # Both pre and post get their own theoretical ceiling/floor
+    # ------------------------------------------------------------------
+    Reward_minmax_theo = (Reward - R_min_theo) /
+                         (R_max_theo - R_min_theo + 1e-6),
+
+    # ------------------------------------------------------------------
+    # METHOD 1b: Min-Max (Empirical bounds, within Participant x stim x env)
+    # Stretches observed range to [0,1] separately for env1 and env2
+    # and separately for pre and post stimulation
+    # ------------------------------------------------------------------
+    Reward_minmax_emp = (Reward - R_min_empirical) /
+                        (R_max_empirical - R_min_empirical + 1e-6),
+
+    # ------------------------------------------------------------------
+    # METHOD 2a: Percent of theoretical maximum
+    # Reward as a fraction of the theoretical ceiling for that condition
+    # ------------------------------------------------------------------
+    Reward_pct_max_theo = Reward / R_max_theo,
+
+    # ------------------------------------------------------------------
+    # METHOD 2b: Percent of empirical maximum
+    # Reward as a fraction of the highest reward observed for this
+    # participant in this condition x environment
+    # ------------------------------------------------------------------
+    Reward_pct_max_emp = Reward / (R_max_empirical + 1e-6),
+
+    # ------------------------------------------------------------------
+    # METHOD 2c: Percent of empirical patch-level maximum
+    # Reward as a fraction of the best reward in the SAME patch
+    # Captures depletion relative to that specific patch's peak
+    # ------------------------------------------------------------------
+    Reward_pct_max_patch = Reward / (R_max_empirical_patch + 1e-6),
+
+    # ------------------------------------------------------------------
+    # METHOD 3: Within-participant x stim x env Z-score
+    # Centers and scales relative to each person's own distribution
+    # in each condition and environment separately
+    # ------------------------------------------------------------------
+    Reward_z_within = scale(Reward)[, 1],
+
+    # ------------------------------------------------------------------
+    # METHOD 4: Relative to baseline (task-anchored)
+    # (Reward - baseline) / reward_increment
+    # 0 = exactly at baseline; 1 = one full increment above baseline
+    # ------------------------------------------------------------------
+    Reward_rel_baseline = (Reward - rew_base) / (rew_hi + 1e-6),
+
+    # ------------------------------------------------------------------
+    # METHOD 5: Percentile rank within Participant x stim x env
+    # r = rank(Reward) / N
+    # Converts reward to its percentile position in the local distribution
+    # Robust to outliers and skew; does not assume any distribution shape
+    # ------------------------------------------------------------------
+    Reward_percentile = rank(Reward, ties.method = "average") / n()
+
+  ) %>%
+  ungroup()
+```
+
+```{r}
+# -----------------------------------------------------------------------
+# METHOD 6: Softmax Normalization — within each PATCH
+# r_i = exp(beta * Reward_i) / sum(exp(beta * Reward_j))
+# beta = 0.1 (controls sensitivity; higher = more peaked toward top reward)
+# Captures relative value of each trial within the local patch context
+# -----------------------------------------------------------------------
+beta <- 0.1
+
+df <- df %>%
+  group_by(Participant_ID, stim_cat, env, patch_id) %>%
+  mutate(
+    exp_reward       = exp(beta * Reward),
+    Reward_softmax   = exp_reward / sum(exp_reward, na.rm = TRUE)
+  ) %>%
+  ungroup() %>%
+  select(-exp_reward)
+```
+
+```{r}
+# -----------------------------------------------------------------------
+# METHOD 7: Deviation from Patch Start
+# r = Reward / Reward_first_trial
+# Measures how much reward has depleted since entering the patch
+# Values < 1 indicate depletion; > 1 would indicate an unexpected increase
+# -----------------------------------------------------------------------
+df <- df %>%
+  group_by(Participant_ID, stim_cat, env, patch_id) %>%
+  mutate(
+    Reward_first_trial   = first(Reward),
+    Reward_patch_dev     = Reward / (Reward_first_trial + 1e-6)
+  ) %>%
+  ungroup()
+```
+
+```{r}
+# -----------------------------------------------------------------------
+# GLOBAL Z-SCORES for all normalized reward variables
+# Puts all predictors on a common scale for model comparison
+# and improves MCMC sampler efficiency
+# -----------------------------------------------------------------------
+df <- df %>%
+  mutate(
+    # Min-max
+    Reward_minmax_theo_z       = scale(Reward_minmax_theo)[, 1],
+    Reward_minmax_emp_z        = scale(Reward_minmax_emp)[, 1],
+
+    # Pct of max (three variants)
+    Reward_pct_max_theo_z      = scale(Reward_pct_max_theo)[, 1],
+    Reward_pct_max_emp_z       = scale(Reward_pct_max_emp)[, 1],
+    Reward_pct_max_patch_z     = scale(Reward_pct_max_patch)[, 1],
+
+    # Within z-score (already centered/scaled within group, but global z for consistency)
+    Reward_z_within_z          = scale(Reward_z_within)[, 1],
+
+    # Relative to baseline
+    Reward_rel_baseline_z      = scale(Reward_rel_baseline)[, 1],
+
+    # Percentile rank
+    Reward_percentile_z        = scale(Reward_percentile)[, 1],
+
+    # Softmax
+    Reward_softmax_z           = scale(Reward_softmax)[, 1],
+
+    # Patch deviation
+    Reward_patch_dev_z         = scale(Reward_patch_dev)[, 1],
+
+    # Covariates
+    trial_in_patch_z           = scale(trial_in_patch)[, 1],
+    patch_id_z                 = scale(patch_id)[, 1],
+    AvgRewardRate_before_z     = scale(AvgRewardRate_before)[, 1]
+  )
+```
+
+```{r}
+# -----------------------------------------------------------------------
+# DISTRIBUTION CHECK: visualize all normalized reward methods
+# -----------------------------------------------------------------------
+p1 <- df %>%
+  select(stim_cat, env,
+         Reward,
+         Reward_minmax_theo, Reward_minmax_emp,
+         Reward_rel_baseline,
+         Reward_percentile,
+         Reward_patch_dev) %>%
+  pivot_longer(cols = -c(stim_cat, env),
+               names_to = "method", values_to = "value") %>%
+  ggplot(aes(x = value, fill = stim_cat)) +
+  geom_density(alpha = 0.5) +
+  facet_wrap(~method, scales = "free") +
+  theme_minimal() +
+  labs(title = "Distribution of Normalized Rewards by Condition",
+       x = "Value", y = "Density")
+print(p1)
+
+# Also facet by environment to verify env-wise separation
+p1b <- df %>%
+  select(stim_cat, env,
+         Reward_minmax_emp, Reward_pct_max_emp) %>%
+  pivot_longer(cols = -c(stim_cat, env),
+               names_to = "method", values_to = "value") %>%
+  ggplot(aes(x = value, fill = interaction(stim_cat, env))) +
+  geom_density(alpha = 0.4) +
+  facet_wrap(~method, scales = "free") +
+  theme_minimal() +
+  labs(title = "Empirical Methods: Distribution by Condition × Environment",
+       x = "Value", y = "Density",
+       fill = "stim_cat.env")
+print(p1b)
+```
+
+
+```{r}
+# -----------------------------------------------------------------------
+# MODEL LIST: all normalized reward predictors
+# -----------------------------------------------------------------------
+reward_vars <- c(
+  "Reward_minmax_theo_z",
+  "Reward_minmax_emp_z",
+  "Reward_pct_max_theo_z",
+  "Reward_pct_max_emp_z",
+  "Reward_pct_max_patch_z",
+  "Reward_z_within_z",
+  "Reward_rel_baseline_z",
+  "Reward_percentile_z",
+  "Reward_softmax_z",
+  "Reward_patch_dev_z"
+)
+```
+
+```{r}
+# -----------------------------------------------------------------------
+# FIT BAYESIAN MIXED-EFFECTS MODELS (Student-t for heavy tails)
+# Formula: HandlingTime ~ stim_cat * reward_var + covariates + (1 + stim_cat | ID)
+# -----------------------------------------------------------------------
+models <- list()
+
+for (reward_var in reward_vars) {
+
+  cat(sprintf("\nFitting model: %s\n", reward_var))
+  cat("----------------------------------------\n")
+
+  formula_str <- sprintf(
+    "HandlingTime_safe ~ stim_cat * %s +
+     trial_in_patch_z + patch_id_z + AvgRewardRate_before_z +
+     (1 | Participant_ID)",
+    reward_var
+  )
+
+  models[[reward_var]] <- brm(
+    as.formula(formula_str),
+    data      = df,
+    family    = student(),
+    chains    = 4,
+    iter      = 3000,
+    warmup    = 1000,
+    cores     = 4,
+    seed      = 123,
+    save_pars = save_pars(all = TRUE),
+    file      = sprintf("model_%s", reward_var),
+    file_refit = "on_change"
+  )
+}
+```
+```{r}
+models$Reward_z_within_z <- NULL
+loo_list <- lapply(models, loo)
+loo_results <- loo_compare(loo_list)
+print(loo_results)
+```
+
+
+
+```{r}
+r2_results <- map_df(names(models), function(nm) {
+  r2 <- bayes_R2(models[[nm]])
+  data.frame(
+    Normalization = nm,
+    R2_mean  = r2[1, "Estimate"],
+    R2_lower = r2[1, "Q2.5"],
+    R2_upper = r2[1, "Q97.5"]
+  )
+}) %>% arrange(desc(R2_mean))
+
+print(r2_results)
+```
+
+
+```{r}
+# -----------------------------------------------------------------------
+# EXTRACT INTERACTION TERM: stim_catpre × reward_var
+# -----------------------------------------------------------------------
+extract_interaction <- function(model, name) {
+  sum_df <- as.data.frame(summary(model)$fixed)
+  interaction_row <- grep("stim_catpre:", rownames(sum_df), value = TRUE)[1]
+
+  if (length(interaction_row) > 0 && !is.na(interaction_row)) {
+    data.frame(
+      Normalization = name,
+      Estimate      = sum_df[interaction_row, "Estimate"],
+      SE            = sum_df[interaction_row, "Est.Error"],
+      CI_lower      = sum_df[interaction_row, "l-95% CI"],
+      CI_upper      = sum_df[interaction_row, "u-95% CI"],
+      Rhat          = sum_df[interaction_row, "Rhat"],
+      Bulk_ESS      = sum_df[interaction_row, "Bulk_ESS"],
+      row.names = NULL
+    )
+  }
+}
+
+interaction_df <- map2_df(models, names(models), extract_interaction)
+interaction_df <- interaction_df %>% arrange(Estimate)
+print(interaction_df)
+```
+
+```{r}
+# -----------------------------------------------------------------------
+# PLOT: Interaction effects across normalization methods
+# -----------------------------------------------------------------------
+p2 <- ggplot(interaction_df,
+             aes(x = reorder(Normalization, Estimate), y = Estimate)) +
+  geom_point(size = 4) +
+  geom_errorbar(aes(ymin = CI_lower, ymax = CI_upper),
+                width = 0.3, linewidth = 1) +
+  geom_hline(yintercept = 0, linetype = "dashed",
+             color = "red", linewidth = 1) +
+  coord_flip() +
+  theme_minimal(base_size = 12) +
+  labs(
+    title    = "Interaction Effect: stim_catpre × Reward",
+    subtitle = "Comparison across normalization methods (95% Credible Intervals)",
+    x        = "Normalization Method",
+    y        = "Coefficient Estimate"
+  ) +
+  theme(plot.title = element_text(face = "bold", size = 14))
+print(p2)
+```
+
+
+
+```{r}
+# -----------------------------------------------------------------------
+# EXTRACT MAIN EFFECT OF stim_catpre across all models
+# -----------------------------------------------------------------------
+extract_stim_main <- function(model, name) {
+  sum_df   <- as.data.frame(summary(model)$fixed)
+  stim_row <- grep("^stim_catpre$", rownames(sum_df), value = TRUE)
+
+  if (length(stim_row) > 0) {
+    data.frame(
+      Normalization = name,
+      Estimate      = sum_df[stim_row, "Estimate"],
+      SE            = sum_df[stim_row, "Est.Error"],
+      CI_lower      = sum_df[stim_row, "l-95% CI"],
+      CI_upper      = sum_df[stim_row, "u-95% CI"],
+      Rhat          = sum_df[stim_row, "Rhat"],
+      Bulk_ESS      = sum_df[stim_row, "Bulk_ESS"],
+      row.names = NULL
+    )
+  }
+}
+
+stim_df <- purrr::map2_df(models, names(models), extract_stim_main)
+stim_df <- stim_df %>% arrange(Estimate)
+print(stim_df)
+```
