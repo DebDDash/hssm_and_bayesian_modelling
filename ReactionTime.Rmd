@@ -1,0 +1,277 @@
+---
+output:
+  pdf_document: default
+  html_document: default
+---
+Does tACS affect the speed of decision-making in a foraging task?
+
+
+```{r}
+library(tidyverse)
+library(brms)
+library(bayesplot)
+library(loo)
+library(sjPlot)
+library(performance)
+
+# Set options
+options(mc.cores = parallel::detectCores())
+rstan::rstan_options(auto_write = TRUE)
+```
+
+```{r}
+df_p1 <- read.csv("/Users/debarpita/Desktop/arjun/trial_wise_dataset_post.csv")
+df_p2 <- read.csv("/Users/debarpita/Desktop/arjun/trial_wise_dataset_pre.csv")
+library(dplyr)
+df <- bind_rows(df_p1, df_p2)
+```
+
+```{r}
+cat(sprintf("Missing ReactionTime: %d (%.1f%%)\n", 
+            sum(is.na(df$ReactionTime)), 
+            100 * mean(is.na(df$ReactionTime))))
+df <- df %>% filter(!is.na(ReactionTime))
+```
+
+
+```{r}
+summary(df$ReactionTime)
+
+# Remove extreme outliers (Turkey IQR rule)
+Q1 <- quantile(df$ReactionTime, 0.25, na.rm = TRUE)
+Q3 <- quantile(df$ReactionTime, 0.75, na.rm = TRUE)
+IQR <- Q3 - Q1
+df <- df %>%
+  filter(ReactionTime >= Q1 - 1.5 * IQR,
+         ReactionTime <= Q3 + 1.5 * IQR)
+
+cat(sprintf("After outlier removal: %d observations\n", nrow(df)))
+```
+original was 6016
+
+
+```{r}
+# Log-transform ReactionTime
+df <- df %>%
+  mutate(log_ReactionTime = log(ReactionTime + 1e-6))
+
+# Create trial number
+df <- df %>%
+  group_by(Participant_ID, stim_cat) %>%
+  mutate(trial_number = row_number()) %>%
+  ungroup()
+
+# Z-score predictors
+df <- df %>%
+  mutate(
+    trial_number_z = scale(trial_number)[,1],
+    AvgRewardRate_z = scale(AvgRewardRate)[,1],
+    trait_anxiety_score_z = scale(trait_anxiety_score)[,1]
+  )
+```
+
+```{r}
+df <- df %>%
+  group_by(Participant_ID, stim_cat, env) %>%
+  mutate(AvgRewardRate_before = lag(AvgRewardRate)) %>%
+  ungroup() %>%
+  filter(!is.na(AvgRewardRate_before))
+```
+
+```{r}
+df <- df %>%
+  mutate(
+    AvgRewardRate_before_z = scale(AvgRewardRate_before)[,1]
+  )
+```
+
+
+```{r}
+# Distribution of ReactionTime
+p1 <- ggplot(df, aes(x = ReactionTime, fill = stim_cat)) +
+  geom_histogram(bins = 50, alpha = 0.6, position = "identity") +
+  facet_wrap(~stim_cat, ncol = 1) +
+  theme_minimal() +
+  labs(title = "Distribution of Reaction Time by Condition",
+       x = "Reaction Time (s)", y = "Count")
+
+print(p1)
+
+# Log-transformed
+p2 <- ggplot(df, aes(x = log_ReactionTime, fill = stim_cat)) +
+  geom_density(alpha = 0.6) +
+  theme_minimal() +
+  labs(title = "Distribution of Log(Reaction Time) by Condition",
+       x = "Log(Reaction Time)", y = "Density")
+
+print(p2)
+```
+
+
+
+```{r}
+# Reaction time over trials
+df_summary <- df %>%
+  group_by(stim_cat, trial_number) %>%
+  summarise(
+    mean_RT = mean(log_ReactionTime, na.rm = TRUE),
+    se_RT = sd(log_ReactionTime, na.rm = TRUE) / sqrt(n()),
+    .groups = "drop"
+  )
+
+ggplot(df_summary, aes(x = trial_number, y = mean_RT, color = stim_cat)) +
+  geom_line(size = 1) +
+  geom_ribbon(aes(ymin = mean_RT - se_RT, ymax = mean_RT + se_RT, fill = stim_cat),
+              alpha = 0.2, color = NA) +
+  theme_minimal() +
+  labs(title = "Reaction Time Over Trials",
+       x = "Trial Number", y = "Mean Log(Reaction Time)",
+       subtitle = "Do participants get faster with practice?")
+```
+
+Model 1: Baseline tACS Effect
+Does tACS change the baseline speed of decision-making?
+log(ReactionTime) ~ stim_cat + trial_number + (1|Participant_ID)
+
+```{r model1_fit}
+model1 <- brm(
+  log_ReactionTime ~ stim_cat + trial_number_z + (1 | Participant_ID),
+  data = df,
+  family = gaussian(),
+  chains = 4,
+  iter = 3000,
+  warmup = 1000,
+  cores = 4,
+  seed = 123,
+  file = "model1_RT_baseline"
+)
+```
+
+```{r}
+summary(model1)
+```
+
+β_stim_catpre > 0: Pre-stimulation decisions are SLOWER -> confidencce doesnt include 0
+β_trial_number < 0: Decisions get FASTER over time (learning/practice effect)
+
+
+```{r}
+pp_check(model1)
+```
+
+
+
+Model 2: Reward Context Effect
+Does environmental richness (average reward rate) speed up or slow down decisions?
+log(ReactionTime) ~ AvgRewardRate_before + trial_number + (1|Participant_ID)
+
+
+```{r}
+modell2 <- brm(
+  log_ReactionTime ~ AvgRewardRate_before_z + trial_number_z + (1 | Participant_ID),
+  data = df,
+  family = gaussian(),
+  chains = 4,
+  iter = 3000,
+  warmup = 1000,
+  cores = 4,
+  seed = 123,
+  file = "model2_RT_reward"
+)
+```
+
+
+
+```{r}
+summary(modell2)
+```
+β_AvgRewardRate < 0: Richer environments → FASTER decisions and ci doesnt include 0
+
+```{r}
+pp_check(model2, ndraws = 100)
+```
+
+
+Model 3: (Stimulation × Reward Context)
+Does tACS change how reward context affects decision speed?
+log(ReactionTime) ~ stim_cat * AvgRewardRatebefore + trial_number + (1|Participant_ID)`
+
+
+
+```{r}
+model3 <- brm(
+  log_ReactionTime ~ stim_cat * AvgRewardRate_before_z + trial_number_z + 
+                     (1 | Participant_ID),
+  data = df,
+  family = gaussian(),
+  chains = 4,
+  iter = 3000,
+  warmup = 1000,
+  cores = 4,
+  seed = 123,
+  file = "model3_RT_interaction"
+)
+```
+
+
+```{r}
+summary(model3)
+```
+
+β_interaction < 0: Pre-stim shows STRONGER speeding effect in rich environments
+
+
+
+```{r}
+ce <- conditional_effects(model3,
+                          effects = "AvgRewardRate_before_z:stim_cat")
+
+p <- plot(ce, plot = FALSE)[[1]] +
+  labs(title = "Interaction: Reward Context × Stimulation",
+       subtitle = "How does reward richness affect decision speed in each condition?",
+       x = "Average Reward Rate (z-scored)",
+       y = "Handling Time") +
+  theme_minimal()
+
+print(p)
+```
+
+
+
+
+```{r}
+pp_check(model3, ndraws = 100)
+```
+
+
+Model 4: Adding Anxiety
+Does trait anxiety modulate the effects of tACS on decision speed?
+log(ReactionTime) ~ stim_cat * AvgRewardRatebefore + trait_anxiety + trial_number + (1|Participant_ID)`
+
+
+
+```{r}
+model4 <- brm(
+  log_ReactionTime ~ stim_cat * AvgRewardRate_before_z + trait_anxiety_score_z + 
+                     trial_number_z + (1 | Participant_ID),
+  data = df,
+  family = gaussian(),
+  chains = 4,
+  iter = 3000,
+  warmup = 1000,
+  cores = 4,
+  seed = 123,
+  file = "model4_RT_anxiety"
+)
+```
+
+```{r}
+summary(model4)
+```
+
+β_anxiety < 0: Higher anxiety → FASTER decisions  but ci includes 0
+
+```{r}
+pp_check(model4, ndraws = 100)
+```
+
