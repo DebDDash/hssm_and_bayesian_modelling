@@ -1,0 +1,189 @@
+---
+output:
+  pdf_document: default
+  html_document: default
+---
+
+```{r}
+library(tidyverse)
+library(brms)
+library(bayesplot)
+library(loo)
+options(mc.cores = parallel::detectCores())
+rstan::rstan_options(auto_write = TRUE)
+```
+
+
+```{r}
+df_post <- read.csv("/Users/debarpita/Desktop/arjun/trial_wise_dataset_post.csv")
+df_pre  <- read.csv("/Users/debarpita/Desktop/arjun/trial_wise_dataset_pre.csv")
+df      <- bind_rows(df_post, df_pre)
+
+df <- df %>%
+  mutate(env = as.integer(env == 2))
+
+df <- df %>% filter(Reward != 0)
+
+df <- df %>%
+  mutate(
+    rew_base = ifelse(stim_cat == "post",  91, 181),
+    rew_hi   = ifelse(stim_cat == "post",   9,  19)
+  )
+
+df <- df %>%
+  group_by(Participant_ID, stim_cat, env) %>%
+  mutate(
+    R_min_empirical = min(Reward, na.rm = TRUE),
+    R_max_empirical = max(Reward, na.rm = TRUE)
+  ) %>%
+  ungroup()
+```
+
+
+```{r}
+df <- df %>%
+  group_by(Participant_ID, stim_cat, env) %>%
+  arrange(patch_id, .by_group = TRUE) %>%
+  mutate(patch_number = patch_id) %>%
+  ungroup()
+
+df <- df %>%
+  group_by(Participant_ID, stim_cat, env) %>%
+  mutate(
+    Reward_rel_baseline = (Reward - rew_base) / (rew_hi + 1e-6),
+    Reward_minmax_emp   = (Reward - R_min_empirical) /
+                          (R_max_empirical - R_min_empirical + 1e-6)
+  ) %>%
+  ungroup()
+```
+
+
+```{r}
+df_nonzero <- df %>%
+  group_by(Participant_ID, stim_cat, env) %>%
+  arrange(patch_id, patch_number, .by_group = TRUE) %>%
+  mutate(
+    CumReward_raw          = cumsum(Reward),
+    CumReward_rel_baseline = cumsum(Reward_rel_baseline),
+    CumReward_minmax_emp   = cumsum(Reward_minmax_emp)
+  ) %>%
+  ungroup()
+
+df_nonzero <- df_nonzero %>%
+  group_by(Participant_ID, stim_cat, env) %>%
+  mutate(
+    patch_number_z = as.numeric(scale(patch_number))
+  ) %>%
+  ungroup()
+```
+
+
+```{r}
+df_nonzero <- df_nonzero %>%
+  mutate(
+    CumReward_raw_z          = scale(CumReward_raw)[, 1],
+    CumReward_rel_baseline_z = scale(CumReward_rel_baseline)[, 1],
+    CumReward_minmax_emp_z   = scale(CumReward_minmax_emp)[, 1],
+    trait_anxiety_score_z    = scale(trait_anxiety_score)[, 1]
+  )
+
+cat(sprintf("Observations after dropping zero-reward trials: %d\n", nrow(df_nonzero)))
+
+df_nonzero %>%
+  group_by(stim_cat, env) %>%
+  summarise(
+    n                 = n(),
+    mean_raw          = mean(CumReward_raw,          na.rm = TRUE),
+    mean_rel_baseline = mean(CumReward_rel_baseline, na.rm = TRUE),
+    mean_minmax_emp   = mean(CumReward_minmax_emp,   na.rm = TRUE),
+    .groups = "drop"
+  )
+```
+
+
+```{r}
+modelC1 <- brm(
+  CumReward_rel_baseline_z ~ patch_number_z * stim_cat + env +
+    (1 | Participant_ID),
+  data    = df_nonzero,
+  family  = gaussian(),
+  chains  = 4,
+  iter    = 4000,
+  warmup  = 1500,
+  cores   = 4,
+  seed    = 123,
+  file    = "modelC1_cum_rel_baseline_patches"
+)
+
+summary(modelC1)
+```
+```{r}
+pp_check(modelC1, type = "dens_overlay", ndraws = 100)
+```
+
+
+```{r}
+modelC2 <- brm(
+  CumReward_rel_baseline_z ~ patch_number_z * stim_cat * trait_anxiety_score_z + env +
+    (1 | Participant_ID),
+  data    = df_nonzero,
+  family  = gaussian(),
+  chains  = 4,
+  iter    = 4000,
+  warmup  = 1500,
+  cores   = 4,
+  seed    = 123,
+  file    = "modelC2_cum_rel_baseline_anxiety"
+)
+
+summary(modelC2)
+```
+```{r}
+pp_check(modelC2, ndraws = 100)
+
+```
+
+
+```{r}
+modelD1 <- brm(
+  CumReward_minmax_emp_z ~ patch_number_z * stim_cat + env +
+    (1 | Participant_ID),
+  data    = df_nonzero,
+  family  = gaussian(),
+  chains  = 4,
+  iter    = 4000,
+  warmup  = 1500,
+  cores   = 4,
+  seed    = 123,
+  file    = "modelD1_cum_minmax_emp_patches"
+)
+
+summary(modelD1)
+```
+
+```{r}
+
+pp_check(modelD1, type = "dens_overlay", ndraws = 100)
+```
+
+```{r}
+modelD2 <- brm(
+  CumReward_minmax_emp_z ~ patch_number_z * stim_cat * trait_anxiety_score_z + env +
+    (1 | Participant_ID),
+  data    = df_nonzero,
+  family  = gaussian(),
+  chains  = 4,
+  iter    = 4000,
+  warmup  = 1500,
+  cores   = 4,
+  seed    = 123,
+  file    = "modelD2_cum_minmax_emp_anxiety"
+)
+
+summary(modelD2)
+
+```
+```{r}
+pp_check(modelD2, ndraws = 100)
+```
+
