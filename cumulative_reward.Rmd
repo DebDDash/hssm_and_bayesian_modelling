@@ -1,0 +1,135 @@
+---
+output:
+  pdf_document: default
+  html_document: default
+---
+```{r}
+library(tidyverse)
+library(brms)
+library(bayesplot)
+library(loo)
+
+options(mc.cores = parallel::detectCores())
+rstan::rstan_options(auto_write = TRUE)
+```
+
+```{r load_data}
+df_p1 <- read.csv("/Users/debarpita/Desktop/arjun/trial_wise_dataset_post.csv")
+df_p2 <- read.csv("/Users/debarpita/Desktop/arjun/trial_wise_dataset_pre.csv")
+
+df <- bind_rows(df_p1, df_p2)
+```
+
+
+```{r}
+df <- df %>%
+  filter(!is.na(Reward), Reward != 0)
+df <- df %>%
+  group_by(Participant_ID, stim_cat, env) %>%
+  arrange(patch_id, .by_group = TRUE) %>%
+  mutate(patch_number = patch_id) %>%
+  ungroup()
+
+# Remove patches with zero cumulative reward
+df <- df %>%
+  group_by(Participant_ID, stim_cat, env, patch_number) %>%
+  filter(min(TotalCumulativeReward, na.rm = TRUE) > 0) %>%
+  ungroup()
+
+# Z-score predictors
+df <- df %>%
+  mutate(
+    patch_number_z = scale(patch_number)[,1],
+    trait_anxiety_score_z = scale(trait_anxiety_score)[,1]
+  )
+
+summary(df$TotalCumulativeReward)
+```
+
+```{r}
+df %>%
+  group_by(stim_cat, env) %>%
+  summarise(
+    n = n(),
+    min_cum = min(TotalCumulativeReward, na.rm = TRUE),
+    max_cum = max(TotalCumulativeReward, na.rm = TRUE),
+    mean_cum = mean(TotalCumulativeReward, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+```
+
+
+
+
+Model 1: Learning Across Patches
+Do participants increase cumulative reward across patches within each environment, and does stimulation alter the rate of reward growth?
+Because cumulative reward is strictly positive and right-skewed, we use a Gamma regression with log link.
+
+```{r}
+model1 <- brm(
+  TotalCumulativeReward ~ patch_number_z * stim_cat + env +
+    (1 | Participant_ID),
+  data = df,
+  family = Gamma(link = "log"),
+  chains = 4,
+  iter = 4000,
+  warmup = 1500,
+  cores = 4,
+  seed = 123
+)
+```
+
+```{r}
+summary(model1)
+```
+
+beta_patch_number_z > 0:  Cumulative reward increases across patches  4% increase
+
+```{r}
+exp(fixef(model1))
+```
+
+```{r}
+pp_check(model1, type = "dens_overlay", ndraws = 100)
+```
+
+```{r}
+pp_check(model1, type = "stat_grouped", group = "stim_cat")
+```
+
+```{r}
+model2 <- brm(
+  TotalCumulativeReward ~ patch_number_z * stim_cat *
+    trait_anxiety_score_z + env +
+    (1  | Participant_ID),
+  data = df,
+  family = Gamma(link = "log"),
+  chains = 4,
+  iter = 4000,
+  warmup = 1500,
+  cores = 4,
+  seed = 123
+)
+
+```
+
+```{r}
+summary(model2)
+```
+
+patch_number_z = 1.46- Participants clearly accumulate more reward over successive patches.
+Environment 2 has ~83% lower cumulative reward than Environment 1.
+patch_number_z:stim_catpre = -0.30- The learning slope in pre-stim is 26% flatter than in post-stim
+Main anxiety effect: -0.01 -No overall anxiety effect on reward level
+stim × anxiety: -0.06 -Higher anxiety people have slightly lower cumulative reward in pre condition.
+
+patch_number_z:stim_catpre:trait_anxiety_score_z = -0.05, CI excludes zero.
+In pre-stim condition, higher anxiety reduces learning slope. In post-stim condition, this anxiety-related reduction is attenuated.
+So stimulation may buffer anxiety-related learning deficits.
+
+Random slope correlation = 0.95 -Participants who start with higher reward also show steeper learning slopes
+```{r}
+ pp_check(model2)
+```
+
